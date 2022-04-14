@@ -96,13 +96,6 @@ impl BindContext {
         }
     }
 
-    pub fn judge_column_is_exist(&self, column_name: &String) -> bool {
-        match self.indexs_of.get(column_name) {
-            Some(_indexs) => true,
-            None => false,
-        }
-    }
-
     pub fn get_column(&self, column_name: &String) -> Result<&ColumnBinding> {
         let index = self.get_index(column_name)?;
         Ok(&self.columns[index])
