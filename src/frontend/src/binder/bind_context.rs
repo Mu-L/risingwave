@@ -18,7 +18,7 @@ use std::fmt::Display;
 use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct ColumnBinding {
     pub table_name: String,
     pub column_name: String,
@@ -94,6 +94,27 @@ impl BindContext {
         } else {
             Ok(columns[0])
         }
+    }
+
+    pub fn judge_column_is_exist(&self, column_name: &String) -> bool {
+        match self.indexs_of.get(column_name) {
+            Some(_indexs) => true,
+            None => false,
+        }
+    }
+
+    pub fn get_column(&self, column_name: &String) -> Result<&ColumnBinding> {
+        let index = self.get_index(column_name)?;
+        Ok(&self.columns[index])
+    }
+
+    pub fn get_column_with_table_name(
+        &self,
+        column_name: &String,
+        table_name: &String,
+    ) -> Result<&ColumnBinding> {
+        let index = self.get_index_with_table_name(column_name, table_name)?;
+        Ok(&self.columns[index])
     }
 
     fn get_index_with_table_name(

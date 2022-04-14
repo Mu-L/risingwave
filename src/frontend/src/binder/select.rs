@@ -13,11 +13,13 @@
 // limitations under the License.
 
 use std::fmt::Debug;
+use std::iter;
 
 use itertools::Itertools;
+use regex::Regex;
 use risingwave_common::error::{ErrorCode, Result};
 use risingwave_common::types::DataType;
-use risingwave_sqlparser::ast::{Expr, Select, SelectItem};
+use risingwave_sqlparser::ast::{Expr, Ident, Select, SelectItem};
 
 use super::bind_context::{Clause, ColumnBinding};
 use super::UNNAMED_COLUMN;
@@ -115,15 +117,20 @@ impl Binder {
         for item in select_items {
             match item {
                 SelectItem::UnnamedExpr(expr) => {
-                    let alias = match &expr {
-                        Expr::Identifier(ident) => Some(ident.value.clone()),
-                        Expr::CompoundIdentifier(idents) => {
-                            idents.last().map(|ident| ident.value.clone())
+                    let (select_expr, alias) = match &expr.clone() {
+                        Expr::Identifier(ident) => {
+                            (self.bind_expr(expr)?, Some(ident.value.clone()))
                         }
-                        _ => None,
+                        Expr::CompoundIdentifier(idents) => (
+                            self.bind_expr(expr)?,
+                            idents.last().map(|ident| ident.value.clone()),
+                        ),
+                        Expr::FieldIdentifier(field_expr, idents) => {
+                            self.bind_single_field_column(*field_expr.clone(), idents)?
+                        }
+                        _ => (self.bind_expr(expr)?, None),
                     };
-                    let expr = self.bind_expr(expr)?;
-                    select_list.push(expr);
+                    select_list.push(select_expr);
                     aliases.push(alias);
                 }
                 SelectItem::ExprWithAlias { expr, alias } => {
@@ -138,11 +145,16 @@ impl Binder {
                     let (begin, end) = self.context.range_of.get(table_name).ok_or_else(|| {
                         ErrorCode::ItemNotFound(format!("relation \"{}\"", table_name))
                     })?;
-                    let (exprs, names) = Self::bind_columns(&self.context.columns[*begin..*end])?;
+                    let (exprs, names) =
+                        Self::bind_visible_columns(&self.context.columns[*begin..*end])?;
                     select_list.extend(exprs);
                     aliases.extend(names);
                 }
-                SelectItem::ExprQualifiedWildcard(_, _) => todo!(),
+                SelectItem::ExprQualifiedWildcard(expr, idents) => {
+                    let (exprs, names) = self.bind_wildcard_field_column(expr, &idents.0)?;
+                    select_list.extend(exprs);
+                    aliases.extend(names);
+                }
                 SelectItem::Wildcard => {
                     let (exprs, names) = Self::bind_visible_columns(&self.context.columns[..])?;
                     select_list.extend(exprs);
@@ -153,11 +165,162 @@ impl Binder {
         Ok((select_list, aliases))
     }
 
+    /// Bind wildcard field column.
+    pub fn bind_wildcard_field_column(
+        &mut self,
+        expr: Expr,
+        ids: &[Ident],
+    ) -> Result<(Vec<ExprImpl>, Vec<Option<String>>)> {
+        let idents = self.extract_table_and_field_name(expr, ids)?;
+        let (begin, end, column_name) = match &idents[..] {
+            [table, column] => {
+                // Only struct type column can use wildcard selection.
+                let bind = self
+                    .context
+                    .get_column_with_table_name(&column.value, &table.value)?;
+                if !bind.data_type.is_struct() {
+                    return Err(ErrorCode::BindError(format!(
+                        "type {:?} is not composite",
+                        bind.data_type
+                    ))
+                    .into());
+                }
+                let (begin, end) = self.context.range_of.get(&table.value).ok_or_else(|| {
+                    ErrorCode::ItemNotFound(format!("relation \"{}\"", table.value))
+                })?;
+                (*begin, *end, column.value.clone())
+            }
+            [column] => {
+                // Only struct type column can use wildcard selection.
+                let bind = self.context.get_column(&column.value)?;
+                if !bind.data_type.is_struct() {
+                    return Err(ErrorCode::BindError(format!(
+                        "type {:?} is not composite",
+                        bind.data_type
+                    ))
+                    .into());
+                }
+                // If not given table name, use whole index in columns.
+                (0, self.context.columns.len(), column.value.clone())
+            }
+            _ => {
+                return Err(ErrorCode::InternalError(format!(
+                    "The number of idents is not match: {:?}",
+                    idents
+                ))
+                .into());
+            }
+        };
+
+        // Regular expression is '^name+' which match column_name is start with this.
+        let column_re = Regex::new(&("^(".to_owned() + &column_name + ")+\\.{1}")).unwrap();
+        let mut columns: Vec<ColumnBinding> = vec![];
+        for col in &self.context.columns[begin..end] {
+            if column_re.is_match(&col.column_name) {
+                columns.push(col.clone());
+            }
+        }
+
+        Self::bind_columns(&columns[..])
+    }
+
+    /// Bind single field column.
+    pub fn bind_single_field_column(
+        &mut self,
+        expr: Expr,
+        ids: &[Ident],
+    ) -> Result<(ExprImpl, Option<String>)> {
+        let idents = self.extract_table_and_field_name(expr, ids)?;
+        let column = match &idents[..] {
+            [table, column] => self
+                .context
+                .get_column_with_table_name(&column.value, &table.value)?,
+            [column] => self.context.get_column(&column.value)?,
+            _ => {
+                return Err(ErrorCode::InternalError(format!(
+                    "The number of idents is not match: {:?}",
+                    idents
+                ))
+                .into())
+            }
+        };
+        Ok((
+            InputRef::new(column.index, column.data_type.clone()).into(),
+            Some(column.column_name.clone()),
+        ))
+    }
+
+    /// This function will accept three expr type: CompoundIdentifier,Identifier,Cast(Todo)
+    /// We will extract the column name and concat it with idents in ids to form field name.
+    /// Will return table name and field name or just field name.
+    pub fn extract_table_and_field_name(
+        &mut self,
+        expr: Expr,
+        ids: &[Ident],
+    ) -> Result<Vec<Ident>> {
+        match expr {
+            // For CompoundIdentifier, we will use first ident as table name and second ident as
+            // column name.
+            Expr::CompoundIdentifier(idents) => {
+                let (table_name, column): (&String, &String) = match &idents[..] {
+                    [table, column] => (&table.value, &column.value),
+                    _ => {
+                        return Err(ErrorCode::InternalError(format!(
+                            "Too many idents: {:?}",
+                            idents
+                        ))
+                        .into());
+                    }
+                };
+                let fields = iter::once(column.clone())
+                    .chain(ids.iter().map(|id| id.value.clone()))
+                    .collect_vec();
+                Ok(vec![
+                    Ident::new(table_name),
+                    Ident::new(Self::concat_field_idents(fields)),
+                ])
+            }
+            // For Identifier, we will first use the ident as column name and judge if field name is
+            // exist. If not we will use the ident as table name.
+            // The reason is that in pgsql, for table name v3 have a column name v3 which
+            // have a field name v3. Select (v3).v3 from v3 will return the field value instead
+            // of column value.
+            Expr::Identifier(ident) => {
+                let fields: Vec<String> = iter::once(ident.value.clone())
+                    .chain(ids.iter().map(|id| id.value.clone()))
+                    .collect_vec();
+                let field_name = Self::concat_field_idents(fields.clone());
+                if self.context.judge_column_is_exist(&field_name) {
+                    Ok(vec![Ident::new(field_name)])
+                } else {
+                    let field_name = Self::concat_field_idents(fields[1..].to_vec());
+                    Ok(vec![ident, Ident::new(field_name)])
+                }
+            }
+            Expr::Cast { .. } => {
+                todo!()
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// Use . to concat value.
+    pub fn concat_field_idents(idents: Vec<String>) -> String {
+        if idents.is_empty() {
+            return "".to_string();
+        }
+        let mut column_name = idents[0].clone();
+        for id in &idents[1..] {
+            column_name = column_name + "." + id;
+        }
+        column_name
+    }
+
     /// Bind columns exclude field `column_binding` which have `.` in name.
     pub fn bind_columns(columns: &[ColumnBinding]) -> Result<(Vec<ExprImpl>, Vec<Option<String>>)> {
         let bound_columns = columns
             .iter()
-            .filter(|c| !c.column_name.contains('.'))
+            //.filter(|c| !c.column_name.contains('.'))
             .map(|column| {
                 (
                     InputRef::new(column.index, column.data_type.clone()).into(),

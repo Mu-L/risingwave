@@ -166,6 +166,10 @@ impl DataType {
         }
     }
 
+    pub fn is_struct(&self) -> bool {
+        matches!(self, DataType::Struct { .. })
+    }
+
     pub fn data_size(&self) -> DataSize {
         use std::mem::size_of;
         match self {
