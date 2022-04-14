@@ -230,12 +230,24 @@ impl Binder {
 
             catalog
                 .get_table_by_name(&self.db_name, schema_name, table_name)
-                .map(|t| (Relation::BaseTable(Box::new(t.into())), t.columns.clone()))
+                .map(|t| {
+                    let mut table = t.clone();
+                    table.columns = table.columns.iter().flat_map(|c| c.flatten()).collect_vec();
+                    (
+                        Relation::BaseTable(Box::new((&table).into())),
+                        table.columns,
+                    )
+                })
                 .or_else(|_| {
                     catalog
                         .get_source_by_name(&self.db_name, schema_name, table_name)
                         .map(|s| {
-                            let source = s.clone().flatten();
+                            let mut source = s.clone();
+                            source.columns = source
+                                .columns
+                                .iter()
+                                .flat_map(|c| c.flatten())
+                                .collect_vec();
                             (Relation::Source(Box::new((&source).into())), source.columns)
                         })
                 })

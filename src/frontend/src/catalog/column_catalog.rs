@@ -14,6 +14,7 @@
 
 use std::borrow::Cow;
 
+use itertools::Itertools;
 use risingwave_common::catalog::{ColumnDesc, ColumnId};
 use risingwave_common::types::DataType;
 use risingwave_pb::plan::ColumnCatalog as ProstColumnCatalog;
@@ -69,6 +70,21 @@ impl ColumnCatalog {
         for catalog in catalogs {
             catalog.column_desc.generate_increment_id(&mut index);
         }
+    }
+
+    /// Flatten a nested column to a list of columns (including itself).
+    /// If the type is atomic, it returns simply itself.
+    /// If the type has multiple nesting levels, it traverses for the tree-like schema,
+    /// and returns every children node.
+    pub fn flatten(&self) -> Vec<ColumnCatalog> {
+        self.column_desc
+            .flatten()
+            .into_iter()
+            .map(|d| ColumnCatalog {
+                column_desc: d,
+                is_hidden: self.is_hidden,
+            })
+            .collect_vec()
     }
 }
 
