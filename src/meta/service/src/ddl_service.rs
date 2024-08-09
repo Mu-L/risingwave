@@ -98,7 +98,6 @@ impl DdlServiceImpl {
             .map(ColIndexMapping::from_protobuf);
 
         let stream_job = StreamingJob::Table(source, table, job_type);
-
         ReplaceTableInfo {
             streaming_job: stream_job,
             fragment_graph,
@@ -736,7 +735,7 @@ impl DdlService for DdlServiceImpl {
         _request: Request<GetDdlProgressRequest>,
     ) -> Result<Response<GetDdlProgressResponse>, Status> {
         Ok(Response::new(GetDdlProgressResponse {
-            ddl_progress: self.ddl_controller.get_ddl_progress().await,
+            ddl_progress: self.ddl_controller.get_ddl_progress().await?,
         }))
     }
 
